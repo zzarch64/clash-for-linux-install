@@ -845,7 +845,7 @@ _geo_set_region() {
     local has_group=$("$BIN_YQ" '.proxy-groups.prefix[] | select(.name == "主要代理") | .name' "$CLASH_CONFIG_MIXIN" 2>/dev/null)
 
     if [ -z "$has_group" ]; then
-        # Auto-create the proxy-group structure with url-test for auto speed test
+        # 若无「主要代理」则创建 url-test（仅按 interval 周期测延迟，不调用 REST）
         "$BIN_YQ" eval '.proxy-groups.prefix += [
             {"name": "主要代理", "type": "url-test", "include-all-proxies": true, "filter": "", "url": "http://www.gstatic.com/generate_204", "interval": 300, "tolerance": 50}
         ]' "$CLASH_CONFIG_MIXIN" > "${CLASH_CONFIG_MIXIN}.tmp"
@@ -872,31 +872,6 @@ _geo_set_region() {
 
     # Restart to apply changes
     _merge_config_restart
-
-    # Trigger manual speed test after restart
-    echo ""
-    _okcat "正在触发手动测速..."
-    _geo_trigger_speed_test
-}
-
-_geo_trigger_speed_test() {
-    # Trigger speed test via Clash API
-    local api_url="http://127.0.0.1:9090"
-
-    # Wait a bit for clash to be ready
-    sleep 2
-
-    # Get the proxy group name
-    local group_name="主要代理"
-
-    # Trigger health check via API
-    curl -s -X PUT "$api_url/proxies/$group_name" -H "Content-Type: application/json" -d '{}' >/dev/null 2>&1
-
-    if [ $? -eq 0 ]; then
-        _okcat "测速已触发，将自动选择最快节点"
-    else
-        _failcat "测速触发失败，请确保 Clash 正在运行"
-    fi
 }
 
 function clashgeo() {
