@@ -660,6 +660,220 @@ _sub_log() {
     tail <"${CLASH_PROFILES_LOG}" "$@"
 }
 
+# Geographic region filtering functions
+_extract_geo_regions() {
+    # Extract proxy names and detect geographic regions
+    # Returns: List of unique regions with node counts
+    local proxy_names=$("$BIN_YQ" '.proxies[] | .name' "$CLASH_CONFIG_RUNTIME" 2>/dev/null)
+
+    [ -z "$proxy_names" ] && {
+        _failcat "未找到代理节点，请先添加订阅"
+        return 1
+    }
+
+    # Region patterns: flag emojis and Chinese names
+    local region_patterns=(
+        "🇭🇰香港"
+        "🇯🇵日本"
+        "🇸🇬新加坡"
+        "🇺🇸美国"
+        "🇰🇷韩国"
+        "🇨🇳台湾"
+    )
+
+    local -A region_count
+    local found_regions=()
+
+    # Count proxies for each region
+    for pattern in "${region_patterns[@]}"; do
+        local count=$(echo "$proxy_names" | grep -c "$pattern" || true)
+        if [ "$count" -gt 0 ]; then
+            region_count["$pattern"]=$count
+            found_regions+=("$pattern")
+        fi
+    done
+
+    # If no regions found, show error
+    if [ ${#found_regions[@]} -eq 0 ]; then
+        _failcat "未检测到可识别的地区节点"
+        return 1
+    fi
+
+    # Display available regions
+    local index=1
+    for region in "${found_regions[@]}"; do
+        printf "    %d. %s (%d 个节点)\n" "$index" "$region" "${region_count[$region]}"
+        ((index++))
+    done
+
+    # Return the list as a space-separated string for use in selection
+    echo "${found_regions[@]}"
+}
+
+_geo_interactive() {
+    echo "$(_okcat '✈️ ' '可用地区列表：')"
+    echo ""
+
+    local regions=$(_extract_geo_regions)
+    [ $? -ne 0 ] && return 1
+
+    echo ""
+    echo -n "$(_okcat '✈️ ' '请输入地区编号 (多个用空格分隔, 0=全部):')"
+    read -r selection
+
+    [ -z "$selection" ] && {
+        _failcat "输入不能为空"
+        return 1
+    }
+
+    # Convert selection to regions
+    local -a selected_regions
+    local -a region_array=($regions)
+
+    for num in $selection; do
+        if [ "$num" = "0" ]; then
+            # User wants all regions (clear filter)
+            _geo_set_region "all"
+            return $?
+        fi
+
+        # Validate numeric input
+        if ! [[ "$num" =~ ^[0-9]+$ ]]; then
+            _failcat "无效的输入: $num"
+            return 1
+        fi
+
+        # Check if within range
+        if [ "$num" -lt 1 ] || [ "$num" -gt ${#region_array[@]} ]; then
+            _failcat "无效的编号: $num"
+            return 1
+        fi
+
+        # Add to selected regions (convert to 0-based index)
+        selected_regions+=("${region_array[$((num-1))]}")
+    done
+
+    if [ ${#selected_regions[@]} -eq 0 ]; then
+        _failcat "未选择任何地区"
+        return 1
+    fi
+
+    # Apply the filter with selected regions
+    local region_filter=$(IFS='|'; echo "${selected_regions[*]}")
+    _geo_set_region "$region_filter"
+}
+
+_geo_set_region() {
+    local regions="$1"
+
+    # Check if mixin.yaml has the proxy-group, create if not exists
+    local has_group=$("$BIN_YQ" '.proxy-groups.prefix[] | select(.name == "主要代理") | .name' "$CLASH_CONFIG_MIXIN" 2>/dev/null)
+
+    if [ -z "$has_group" ]; then
+        # Auto-create the proxy-group structure
+        "$BIN_YQ" eval '.proxy-groups.prefix += [
+            {"name": "日本节点", "type": "url-test", "include-all-proxies": true, "filter": "日本", "url": "http://www.gstatic.com/generate_204", "interval": 300},
+            {"name": "新加坡节点", "type": "url-test", "include-all-proxies": true, "filter": "新加坡", "url": "http://www.gstatic.com/generate_204", "interval": 300},
+            {"name": "香港节点", "type": "url-test", "include-all-proxies": true, "filter": "香港", "url": "http://www.gstatic.com/generate_204", "interval": 300},
+            {"name": "主要代理", "type": "url-test", "include-all-proxies": true, "filter": "", "url": "http://www.gstatic.com/generate_204", "interval": 300, "tolerance": 50}
+        ]' "$CLASH_CONFIG_MIXIN" > "${CLASH_CONFIG_MIXIN}.tmp"
+        mv "${CLASH_CONFIG_MIXIN}.tmp" "$CLASH_CONFIG_MIXIN"
+        _okcat "已自动创建地区过滤配置"
+    fi
+
+    if [ "$regions" = "all" ]; then
+        # Clear filter - show all proxies
+        "$BIN_YQ" eval '(.proxy-groups.prefix[] | select(.name == "主要代理") | .filter) = ""' "$CLASH_CONFIG_MIXIN" > "${CLASH_CONFIG_MIXIN}.tmp"
+        mv "${CLASH_CONFIG_MIXIN}.tmp" "$CLASH_CONFIG_MIXIN"
+        _okcat "已清除地区过滤，显示所有节点"
+    else
+        # Apply region filter
+        "$BIN_YQ" eval "(.proxy-groups.prefix[] | select(.name == \"主要代理\") | .filter) = \"$regions\"" "$CLASH_CONFIG_MIXIN" > "${CLASH_CONFIG_MIXIN}.tmp"
+        mv "${CLASH_CONFIG_MIXIN}.tmp" "$CLASH_CONFIG_MIXIN"
+        _okcat "地区过滤已生效: $regions"
+    fi
+
+    # Restart to apply changes
+    _merge_config_restart
+}
+
+_geo_list_regions() {
+    echo "$(_okcat '✈️ ' '可用地区列表：')"
+    echo ""
+    _extract_geo_regions
+    return $?
+}
+
+_geo_get_current() {
+    local current_filter=$("$BIN_YQ" '.proxy-groups.prefix[] | select(.name == "主要代理") | .filter // ""' "$CLASH_CONFIG_MIXIN" 2>/dev/null)
+
+    if [ -z "$current_filter" ]; then
+        _okcat "当前过滤: 无 (显示所有节点)"
+    else
+        _okcat "当前过滤: $current_filter"
+    fi
+}
+
+function clashgeo() {
+    case "$1" in
+    -h | --help)
+        cat <<EOF
+
+clashgeo - Clash 地区过滤工具
+
+Usage:
+  clashgeo [OPTIONS] [REGIONS]
+
+Options:
+  -h, --help          显示帮助信息
+  --current           显示当前过滤设置
+  --list, -l          列出可用地区
+
+Examples:
+  # 交互式选择地区
+  clashgeo
+
+  # 列出可用地区
+  clashgeo --list
+
+  # 显示当前过滤设置
+  clashgeo --current
+
+  # 直接指定单个地区
+  clashgeo 日本
+
+  # 指定多个地区
+  clashgeo 日本 新加坡
+
+  # 清除过滤（显示全部）
+  clashgeo all
+
+EOF
+        return 0
+        ;;
+    --current)
+        _geo_get_current
+        ;;
+    --list | -l)
+        _geo_list_regions
+        ;;
+    "")
+        # Interactive mode
+        _geo_interactive
+        ;;
+    *)
+        # Direct region selection - join multiple regions with "|"
+        local region_filter
+        if [ $# -eq 1 ]; then
+            region_filter="$1"
+        else
+            region_filter=$(IFS='|'; echo "$*")
+        fi
+        _geo_set_region "$region_filter"
+        ;;
+    esac
+}
+
 function clashctl() {
     case "$1" in
     on)
@@ -702,6 +916,10 @@ function clashctl() {
         shift
         clashsub "$@"
         ;;
+    geo)
+        shift
+        clashgeo "$@"
+        ;;
     upgrade)
         shift
         clashupgrade "$@"
@@ -715,8 +933,8 @@ function clashctl() {
 
 clashhelp() {
     cat <<EOF
-    
-Usage: 
+
+Usage:
   clashctl COMMAND [OPTIONS]
 
 Commands:
@@ -726,6 +944,7 @@ Commands:
   status                内核状态
   ui                    面板地址
   sub                   订阅管理
+  geo                   地区过滤
   log                   内核日志
   tun                   Tun 模式
   mixin                 Mixin 配置

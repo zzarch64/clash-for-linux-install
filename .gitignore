@@ -6,6 +6,11 @@ resources/zip/*
 resources/dist/
 test.sh
 
-
+# Runtime generated files
+resources/cache.db
+resources/*.log
+resources/profiles/
+resources/runtime.yaml
+resources/temp.yaml
 
 !.gitkeep
