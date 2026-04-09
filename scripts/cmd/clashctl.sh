@@ -615,10 +615,10 @@ _sub_update() {
             crontab -l | grep -qs 'clashsub update' || {
                 (
                     crontab -l 2>/dev/null
-                    echo "0 0 */2 * * $SHELL -i -c 'clashsub update'"
+                    echo "*/20 * * * * $SHELL -i -c 'clashsub update'"
                 ) | crontab -
             }
-            _okcat "已设置定时更新订阅"
+            _okcat "已设置定时更新订阅（每20分钟）"
             return 0
             ;;
         --convert)
