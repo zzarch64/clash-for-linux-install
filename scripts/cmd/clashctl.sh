@@ -664,117 +664,189 @@ _sub_log() {
 _extract_geo_regions() {
     # Extract proxy names and detect geographic regions
     # Returns: List of unique regions with node counts
-    local proxy_names=$("$BIN_YQ" '.proxies[] | .name' "$CLASH_CONFIG_RUNTIME" 2>/dev/null)
+    # Note: Using CLASH_CONFIG_BASE (original subscription) instead of CLASH_CONFIG_RUNTIME (merged config)
+    local proxy_names=$("$BIN_YQ" '.proxies[] | .name' "$CLASH_CONFIG_BASE" 2>/dev/null)
 
     [ -z "$proxy_names" ] && {
         _failcat "未找到代理节点，请先添加订阅"
         return 1
     }
 
-    # Region patterns: flag emojis and Chinese names
-    local region_patterns=(
-        "🇭🇰香港"
-        "🇯🇵日本"
-        "🇸🇬新加坡"
-        "🇺🇸美国"
-        "🇰🇷韩国"
-        "🇨🇳台湾"
+    # Region definitions: display name and grep pattern
+    local -a region_display_names=(
+        "香港"
+        "日本"
+        "新加坡"
+        "美国"
+        "韩国"
+        "台湾"
     )
 
-    local -A region_count
-    local found_regions=()
+    local -a region_patterns=(
+        "香港|HK|Hong Kong"
+        "日本|JP|Japan|东京|大阪"
+        "新加坡|SG|Singapore"
+        "美国|US|United States|洛杉矶|纽约"
+        "韩国|KR|Korea|首尔"
+        "台湾|TW|Taiwan"
+    )
+
+    local -a region_counts=()
+    local -a found_regions=()
+    local found_any=false
 
     # Count proxies for each region
-    for pattern in "${region_patterns[@]}"; do
-        local count=$(echo "$proxy_names" | grep -c "$pattern" || true)
+    local i=0
+    while [ $i -lt ${#region_patterns[@]} ]; do
+        local pattern="${region_patterns[$i]}"
+        local display_name="${region_display_names[$i]}"
+        local count=$(echo "$proxy_names" | grep -cE "$pattern" || true)
+
         if [ "$count" -gt 0 ]; then
-            region_count["$pattern"]=$count
-            found_regions+=("$pattern")
+            region_counts+=("$count")
+            found_regions+=("$display_name")
+            found_any=true
         fi
+
+        ((i++))
     done
 
     # If no regions found, show error
-    if [ ${#found_regions[@]} -eq 0 ]; then
-        _failcat "未检测到可识别的地区节点"
+    if [ "$found_any" = false ]; then
+        echo ""
+        _failcat "未检测到可识别的地区节点（需要节点名称包含地区标识，如：香港、日本、新加坡、HK、JP等）"
+        echo ""
+        _failcat "调试信息：当前代理节点列表如下"
+        echo "$proxy_names" | head -10 | while IFS= read -r name; do
+            echo "  - $name"
+        done
         return 1
     fi
 
     # Display available regions
     local index=1
-    for region in "${found_regions[@]}"; do
-        printf "    %d. %s (%d 个节点)\n" "$index" "$region" "${region_count[$region]}"
+    for i in "${!found_regions[@]}"; do
+        printf "    %d. %s (%d 个节点)\n" "$index" "${found_regions[$i]}" "${region_counts[$i]}"
         ((index++))
     done
 
-    # Return the list as a space-separated string for use in selection
-    echo "${found_regions[@]}"
+    # Return the list as newline-separated for proper parsing
+    printf "%s\n" "${found_regions[@]}"
+    return 0
 }
 
-_geo_interactive() {
-    echo "$(_okcat '✈️ ' '可用地区列表：')"
+_geo_interactive_selection() {
+    # Show current filter status first
+    local current_filter=$("$BIN_YQ" '.proxy-groups.prefix[] | select(.name == "主要代理") | .filter // ""' "$CLASH_CONFIG_MIXIN" 2>/dev/null)
+    if [ -z "$current_filter" ]; then
+        echo "$(_okcat '[地区] ' '当前状态: 显示所有节点')"
+    else
+        echo "$(_okcat '[地区] ' '当前过滤: 已启用')"
+    fi
     echo ""
 
-    local regions=$(_extract_geo_regions)
-    [ $? -ne 0 ] && return 1
+    # Show available regions
+    echo "$(_okcat '[地区] ' '可用地区列表：')"
+    echo ""
+
+    # Extract regions and capture both output and exit code
+    local regions_output
+    regions_output=$(_extract_geo_regions)
+    local exit_code=$?
+
+    [ $exit_code -ne 0 ] && return $exit_code
+
+    # Display the regions
+    echo "$regions_output" | head -6
+
+    # Extract just the region names (last 6 lines contain the regions)
+    local region_lines=$(echo "$regions_output" | tail -6)
+    local -a region_array=()
+    while IFS= read -r line; do
+        [ -n "$line" ] && region_array+=("$line")
+    done <<< "$region_lines"
+
+    # Get the filter patterns
+    local region_filter_patterns=(
+        "香港|HK|Hong Kong"
+        "日本|JP|Japan|东京|大阪"
+        "新加坡|SG|Singapore"
+        "美国|US|United States|洛杉矶|纽约"
+        "韩国|KR|Korea|首尔"
+        "台湾|TW|Taiwan"
+    )
+
+    local region_display_names=(
+        "香港"
+        "日本"
+        "新加坡"
+        "美国"
+        "韩国"
+        "台湾"
+    )
 
     echo ""
-    echo -n "$(_okcat '✈️ ' '请输入地区编号 (多个用空格分隔, 0=全部):')"
+    echo -n "$(_okcat '[地区] ' '请选择地区 (0=显示全部, q=取消):')"
     read -r selection
+
+    # Handle quit
+    [ "$selection" = "q" ] || [ "$selection" = "Q" ] && return 0
 
     [ -z "$selection" ] && {
         _failcat "输入不能为空"
         return 1
     }
 
-    # Convert selection to regions
-    local -a selected_regions
-    local -a region_array=($regions)
-
-    for num in $selection; do
-        if [ "$num" = "0" ]; then
-            # User wants all regions (clear filter)
-            _geo_set_region "all"
-            return $?
-        fi
-
-        # Validate numeric input
-        if ! [[ "$num" =~ ^[0-9]+$ ]]; then
-            _failcat "无效的输入: $num"
-            return 1
-        fi
-
-        # Check if within range
-        if [ "$num" -lt 1 ] || [ "$num" -gt ${#region_array[@]} ]; then
-            _failcat "无效的编号: $num"
-            return 1
-        fi
-
-        # Add to selected regions (convert to 0-based index)
-        selected_regions+=("${region_array[$((num-1))]}")
-    done
-
-    if [ ${#selected_regions[@]} -eq 0 ]; then
-        _failcat "未选择任何地区"
+    # Validate numeric input
+    if ! [[ "$selection" =~ ^[0-9]+$ ]]; then
+        _failcat "无效的输入: $selection"
         return 1
     fi
 
-    # Apply the filter with selected regions
-    local region_filter=$(IFS='|'; echo "${selected_regions[*]}")
-    _geo_set_region "$region_filter"
+    # Check if selection is "0" (all regions)
+    if [ "$selection" = "0" ]; then
+        _geo_set_region "all"
+        return $?
+    fi
+
+    # Check range
+    if [ "$selection" -lt 1 ] || [ "$selection" -gt ${#region_array[@]} ]; then
+        _failcat "无效的编号: $selection (有效范围: 1-${#region_array[@]})"
+        return 1
+    fi
+
+    # Find the selected region by matching display name
+    local selected_display="${region_array[$((selection-1))]}"
+
+    # Build lookup maps
+    local -A pattern_map name_map
+    local i=0
+    while [ $i -lt ${#region_display_names[@]} ]; do
+        pattern_map["${region_display_names[$i]}"]="${region_filter_patterns[$i]}"
+        name_map["${region_display_names[$i]}"]="${region_display_names[$i]}"
+        ((i++))
+    done
+
+    # Apply filter using the maps
+    if [ -n "${pattern_map[$selected_display]}" ]; then
+        _geo_set_region "${pattern_map[$selected_display]}" "${name_map[$selected_display]}"
+        return $?
+    fi
+
+    _failcat "无法找到对应的地区"
+    return 1
 }
 
 _geo_set_region() {
     local regions="$1"
+    local region_names="$2"
 
     # Check if mixin.yaml has the proxy-group, create if not exists
     local has_group=$("$BIN_YQ" '.proxy-groups.prefix[] | select(.name == "主要代理") | .name' "$CLASH_CONFIG_MIXIN" 2>/dev/null)
 
     if [ -z "$has_group" ]; then
-        # Auto-create the proxy-group structure
+        # Auto-create the proxy-group structure with url-test for auto speed test
         "$BIN_YQ" eval '.proxy-groups.prefix += [
-            {"name": "日本节点", "type": "url-test", "include-all-proxies": true, "filter": "日本", "url": "http://www.gstatic.com/generate_204", "interval": 300},
-            {"name": "新加坡节点", "type": "url-test", "include-all-proxies": true, "filter": "新加坡", "url": "http://www.gstatic.com/generate_204", "interval": 300},
-            {"name": "香港节点", "type": "url-test", "include-all-proxies": true, "filter": "香港", "url": "http://www.gstatic.com/generate_204", "interval": 300},
             {"name": "主要代理", "type": "url-test", "include-all-proxies": true, "filter": "", "url": "http://www.gstatic.com/generate_204", "interval": 300, "tolerance": 50}
         ]' "$CLASH_CONFIG_MIXIN" > "${CLASH_CONFIG_MIXIN}.tmp"
         mv "${CLASH_CONFIG_MIXIN}.tmp" "$CLASH_CONFIG_MIXIN"
@@ -790,27 +862,40 @@ _geo_set_region() {
         # Apply region filter
         "$BIN_YQ" eval "(.proxy-groups.prefix[] | select(.name == \"主要代理\") | .filter) = \"$regions\"" "$CLASH_CONFIG_MIXIN" > "${CLASH_CONFIG_MIXIN}.tmp"
         mv "${CLASH_CONFIG_MIXIN}.tmp" "$CLASH_CONFIG_MIXIN"
-        _okcat "地区过滤已生效: $regions"
+        # Show friendly message with region names if provided
+        if [ -n "$region_names" ]; then
+            _okcat "地区过滤已生效: $region_names"
+        else
+            _okcat "地区过滤已生效"
+        fi
     fi
 
     # Restart to apply changes
     _merge_config_restart
-}
 
-_geo_list_regions() {
-    echo "$(_okcat '✈️ ' '可用地区列表：')"
+    # Trigger manual speed test after restart
     echo ""
-    _extract_geo_regions
-    return $?
+    _okcat "正在触发手动测速..."
+    _geo_trigger_speed_test
 }
 
-_geo_get_current() {
-    local current_filter=$("$BIN_YQ" '.proxy-groups.prefix[] | select(.name == "主要代理") | .filter // ""' "$CLASH_CONFIG_MIXIN" 2>/dev/null)
+_geo_trigger_speed_test() {
+    # Trigger speed test via Clash API
+    local api_url="http://127.0.0.1:9090"
 
-    if [ -z "$current_filter" ]; then
-        _okcat "当前过滤: 无 (显示所有节点)"
+    # Wait a bit for clash to be ready
+    sleep 2
+
+    # Get the proxy group name
+    local group_name="主要代理"
+
+    # Trigger health check via API
+    curl -s -X PUT "$api_url/proxies/$group_name" -H "Content-Type: application/json" -d '{}' >/dev/null 2>&1
+
+    if [ $? -eq 0 ]; then
+        _okcat "测速已触发，将自动选择最快节点"
     else
-        _okcat "当前过滤: $current_filter"
+        _failcat "测速触发失败，请确保 Clash 正在运行"
     fi
 }
 
@@ -821,55 +906,17 @@ function clashgeo() {
 
 clashgeo - Clash 地区过滤工具
 
+快速选择地区过滤，显示所有可用地区供选择。
+
 Usage:
-  clashgeo [OPTIONS] [REGIONS]
-
-Options:
-  -h, --help          显示帮助信息
-  --current           显示当前过滤设置
-  --list, -l          列出可用地区
-
-Examples:
-  # 交互式选择地区
   clashgeo
-
-  # 列出可用地区
-  clashgeo --list
-
-  # 显示当前过滤设置
-  clashgeo --current
-
-  # 直接指定单个地区
-  clashgeo 日本
-
-  # 指定多个地区
-  clashgeo 日本 新加坡
-
-  # 清除过滤（显示全部）
-  clashgeo all
 
 EOF
         return 0
         ;;
-    --current)
-        _geo_get_current
-        ;;
-    --list | -l)
-        _geo_list_regions
-        ;;
-    "")
-        # Interactive mode
-        _geo_interactive
-        ;;
     *)
-        # Direct region selection - join multiple regions with "|"
-        local region_filter
-        if [ $# -eq 1 ]; then
-            region_filter="$1"
-        else
-            region_filter=$(IFS='|'; echo "$*")
-        fi
-        _geo_set_region "$region_filter"
+        # Interactive selection mode with all options integrated
+        _geo_interactive_selection
         ;;
     esac
 }
