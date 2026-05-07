@@ -682,6 +682,383 @@ _sub_log() {
     tail <"${CLASH_PROFILES_LOG}" "$@"
 }
 
+# Clash RESTful API helpers
+_clash_api_get() {
+    local endpoint=$1
+    curl -s --noproxy "*" --max-time 5 \
+        -H "Authorization: Bearer $(_get_secret)" \
+        "http://127.0.0.1:${EXT_PORT}${endpoint}"
+}
+
+_clash_api_put() {
+    local endpoint=$1
+    local data=$2
+    curl -s --noproxy "*" --max-time 5 \
+        -X PUT \
+        -H "Authorization: Bearer $(_get_secret)" \
+        -H "Content-Type: application/json" \
+        -d "$data" \
+        "http://127.0.0.1:${EXT_PORT}${endpoint}"
+}
+
+_clash_api_delay() {
+    local proxy_name=$1
+    local url=${2:-"http://www.gstatic.com/generate_204"}
+    local timeout=${3:-5000}
+    local result
+    result=$(_clash_api_get "/proxies/${proxy_name}/delay?url=${url}&timeout=${timeout}")
+    echo "$result" | "$BIN_YQ" '.delay // 0' 2>/dev/null
+}
+
+# Display width helper (ASCII = 1 column, CJK/multi-byte = 2 columns)
+_display_width() {
+    local str="$1"
+    local len=${#str}
+    local i=0 width=0
+    while [ $i -lt $len ]; do
+        local c="${str:$i:1}"
+        local codepoint
+        codepoint=$(printf '%d' "'$c" 2>/dev/null || echo 0)
+        if [ "$codepoint" -lt 128 ]; then
+            ((width++)); ((i++))
+        else
+            ((width+=2)); ((i++))
+        fi
+    done
+    echo "$width"
+}
+
+_pad_right() {
+    local str="$1" target=$2
+    local width pad
+    width=$(_display_width "$str")
+    pad=$((target - width))
+    [ $pad -lt 0 ] && pad=0
+    printf "%s%*s" "$str" "$pad" ""
+}
+
+# Terminal node selection
+_node_list_groups() {
+    local json=$1
+    local groups
+    groups=$(echo "$json" | "$BIN_YQ" -r '.proxies | to_entries[] | select(.value.type != "Direct") | select(.value.type != "Reject") | select(.value.type != "Compatible") | select(.value.all != null) | .key' 2>/dev/null)
+
+    [ -z "$groups" ] && {
+        _failcat "未找到可用的代理组"
+        return 1
+    }
+    echo "$groups"
+}
+
+_node_get_type() {
+    local json=$1
+    local group=$2
+    echo "$json" | "$BIN_YQ" -r ".proxies.\"${group}\".type // \"\"" 2>/dev/null
+}
+
+_node_show_groups() {
+    local json=$1
+    local groups current count=0
+    groups=$(_node_list_groups "$json") || return 1
+
+    _okcat '[节点] ' '代理组列表：' >/dev/tty
+    echo "" >/dev/tty
+    while IFS= read -r group; do
+        ((count++))
+        current=$(echo "$json" | "$BIN_YQ" -r ".proxies.\"${group}\".now // \"\"" 2>/dev/null)
+        local type
+        type=$(echo "$json" | "$BIN_YQ" -r ".proxies.\"${group}\".type // \"\"" 2>/dev/null)
+        local node_count
+        node_count=$(echo "$json" | "$BIN_YQ" -r ".proxies.\"${group}\".all | length" 2>/dev/null)
+        local padded
+        padded=$(_pad_right "$group" 10)
+        printf "    %2d.  %-8s  %s  [%2d] → %s\n" "$count" "$type" "$padded" "$node_count" "$current" >/dev/tty
+    done <<< "$groups"
+    echo "" >/dev/tty
+    echo "$groups" > "$_NODE_GROUPS_FILE"
+    echo "$count"
+}
+
+_node_select_group() {
+    local json=$1
+    local groups current count
+    count=$(_node_show_groups "$json") || return 1
+
+    echo -n "$(_okcat '[节点] ' '请选择代理组 (q=取消):')" >/dev/tty
+    read -r selection </dev/tty
+
+    [ "$selection" = "q" ] || [ "$selection" = "Q" ] && { rm -f "$_NODE_GROUPS_FILE"; return 1; }
+
+    if ! [[ "$selection" =~ ^[0-9]+$ ]] || [ "$selection" -lt 1 ] || [ "$selection" -gt "$count" ]; then
+        rm -f "$_NODE_GROUPS_FILE"
+        _failcat "无效的编号: $selection"
+        return 1
+    fi
+
+    local selected_group
+    selected_group=$(sed -n "${selection}p" "$_NODE_GROUPS_FILE")
+    rm -f "$_NODE_GROUPS_FILE"
+    echo "$selected_group"
+}
+
+_node_show_nodes() {
+    local json=$1
+    local group=$2
+    local filter=${3:-""}
+    local current
+    current=$(echo "$json" | "$BIN_YQ" -r ".proxies.\"${group}\".now // \"\"" 2>/dev/null)
+
+    local nodes
+    if [ -n "$filter" ]; then
+        # Sanitize: only allow safe regex characters to prevent yq injection
+        filter=$(printf '%s' "$filter" | tr -cd '[:alnum:]._\- ')
+        [ -z "$filter" ] && { _failcat "无效的搜索关键词"; return 1; }
+        nodes=$(echo "$json" | "$BIN_YQ" -r ".proxies.\"${group}\".all[] | select(test(\"(?i)${filter}\"))" 2>/dev/null)
+    else
+        nodes=$(echo "$json" | "$BIN_YQ" -r ".proxies.\"${group}\".all[]" 2>/dev/null)
+    fi
+
+    [ -z "$nodes" ] && {
+        _failcat "没有匹配的节点"
+        return 1
+    }
+
+    _okcat '[节点] ' "代理组: ${group} (当前: ${current})" >/dev/tty
+    _okcat '[节点] ' '正在测速...' >/dev/tty
+
+    local count=0
+    local result_file
+    result_file=$(mktemp /tmp/clashnode.XXXXXX)
+    : > "$result_file"
+    while IFS= read -r node; do
+        ((count++))
+        (
+            delay=$(_clash_api_delay "$node")
+            if [ "$delay" -gt 0 ] 2>/dev/null; then
+                if [ "$delay" -lt 200 ]; then
+                    color="green"
+                elif [ "$delay" -lt 500 ]; then
+                    color="yellow"
+                else
+                    color="red"
+                fi
+                delay_str="${delay}ms"
+            else
+                color="red"
+                delay_str="超时"
+            fi
+            echo "${count}|${color}|${delay_str}|${node}" >> "$result_file"
+        ) &
+    done <<< "$nodes"
+    wait
+
+    echo "" >/dev/tty
+    sort -t'|' -k1 -n "$result_file" | while IFS='|' read -r idx color delay_str node; do
+        local padded
+        padded=$(_pad_right "$node" 36)
+        if [ "$node" = "$current" ]; then
+            case "$color" in
+            green)  printf "  \033[32m▶ %2d.\033[0m  %s  \033[32m%s\033[0m\n" "$idx" "$padded" "$delay_str" >/dev/tty ;;
+            yellow) printf "  \033[32m▶ %2d.\033[0m  %s  \033[33m%s\033[0m\n" "$idx" "$padded" "$delay_str" >/dev/tty ;;
+            red)    printf "  \033[32m▶ %2d.\033[0m  %s  \033[31m%s\033[0m\n" "$idx" "$padded" "$delay_str" >/dev/tty ;;
+            esac
+        else
+            case "$color" in
+            green)  printf "    %2d.  %s  \033[32m%s\033[0m\n" "$idx" "$padded" "$delay_str" >/dev/tty ;;
+            yellow) printf "    %2d.  %s  \033[33m%s\033[0m\n" "$idx" "$padded" "$delay_str" >/dev/tty ;;
+            red)    printf "    %2d.  %s  \033[31m%s\033[0m\n" "$idx" "$padded" "$delay_str" >/dev/tty ;;
+            esac
+        fi
+    done
+    rm -f "$result_file"
+
+    echo "" >/dev/tty
+    echo "$nodes" > "$_NODE_NODES_FILE"
+    echo "$count"
+}
+
+_node_switch() {
+    local group=$1
+    local node=$2
+    local http_code
+    http_code=$(curl -s --noproxy "*" --max-time 5 -o /dev/null -w "%{http_code}" \
+        -X PUT \
+        -H "Authorization: Bearer $(_get_secret)" \
+        -H "Content-Type: application/json" \
+        -d "{\"name\":\"${node}\"}" \
+        "http://127.0.0.1:${EXT_PORT}/proxies/${group}")
+
+    if [ "$http_code" = "204" ] || [ "$http_code" = "200" ]; then
+        _okcat "已切换: ${group} → ${node}"
+        return 0
+    fi
+    _failcat "切换失败 (HTTP ${http_code}): ${group} → ${node}"
+    return 1
+}
+
+_node_test_delay() {
+    local node=$1
+    local delay
+    delay=$(_clash_api_delay "$node")
+    local padded
+    padded=$(_pad_right "$node" 36)
+    if [ "$delay" -gt 0 ] 2>/dev/null; then
+        if [ "$delay" -lt 200 ]; then
+            printf "    %s  \033[32m%s\033[0m\n" "$padded" "${delay}ms"
+        elif [ "$delay" -lt 500 ]; then
+            printf "    %s  \033[33m%s\033[0m\n" "$padded" "${delay}ms"
+        else
+            printf "    %s  \033[31m%s\033[0m\n" "$padded" "${delay}ms"
+        fi
+    else
+        printf "    %s  \033[31m%s\033[0m\n" "$padded" "超时"
+    fi
+}
+
+_node_interactive() {
+    _detect_ext_addr
+    local json
+    json=$(_clash_api_get "/proxies")
+    [ -z "$json" ] && _failcat "内核未运行，请先执行 clashon" && return 1
+
+    local _NODE_GROUPS_FILE _NODE_NODES_FILE
+    _NODE_GROUPS_FILE=$(mktemp /tmp/clashnode.XXXXXX)
+    _NODE_NODES_FILE=$(mktemp /tmp/clashnode.XXXXXX)
+    trap 'rm -f "$_NODE_GROUPS_FILE" "$_NODE_NODES_FILE"' RETURN
+
+    local group
+    if [ -n "$1" ]; then
+        # Direct group name specified
+        local groups
+        groups=$(_node_list_groups "$json") || { rm -f "$_NODE_GROUPS_FILE" "$_NODE_NODES_FILE"; return 1; }
+        if echo "$groups" | grep -qxF "$1"; then
+            group="$1"
+        else
+            _failcat "未找到代理组: $1"
+            rm -f "$_NODE_GROUPS_FILE" "$_NODE_NODES_FILE"
+            return 1
+        fi
+    else
+        group=$(_node_select_group "$json") || { rm -f "$_NODE_GROUPS_FILE" "$_NODE_NODES_FILE"; return 0; }
+    fi
+
+    local type
+    type=$(_node_get_type "$json" "$group")
+
+    case "$type" in
+    Selector)
+        echo "" >/dev/tty
+        echo -n "$(_okcat '[节点] ' '搜索节点 (直接回车跳过):')" >/dev/tty
+        read -r filter </dev/tty
+
+        local count
+        count=$(_node_show_nodes "$json" "$group" "$filter") || { rm -f "$_NODE_GROUPS_FILE" "$_NODE_NODES_FILE"; return 1; }
+
+        echo -n "$(_okcat '[节点] ' '请选择节点 (q=取消):')" >/dev/tty
+        read -r selection </dev/tty
+
+        [ "$selection" = "q" ] || [ "$selection" = "Q" ] && { rm -f "$_NODE_GROUPS_FILE" "$_NODE_NODES_FILE"; return 0; }
+
+        if ! [[ "$selection" =~ ^[0-9]+$ ]] || [ "$selection" -lt 1 ] || [ "$selection" -gt "$count" ]; then
+            rm -f "$_NODE_GROUPS_FILE" "$_NODE_NODES_FILE"
+            _failcat "无效的编号: $selection"
+            return 1
+        fi
+
+        local selected_node
+        selected_node=$(sed -n "${selection}p" "$_NODE_NODES_FILE")
+        rm -f "$_NODE_GROUPS_FILE" "$_NODE_NODES_FILE"
+
+        _node_switch "$group" "$selected_node"
+        ;;
+    *)
+        local current
+        current=$(echo "$json" | "$BIN_YQ" -r ".proxies.\"${group}\".now // \"\"" 2>/dev/null)
+        echo "" >/dev/tty
+        echo "$(_okcat '[节点] ' "${group} (${type}) 当前节点：")" >/dev/tty
+        _node_test_delay "$current"
+        echo "" >/dev/tty
+        echo "$(_okcat '[节点] ' '该组为自动选择模式，无需手动选择节点')" >/dev/tty
+        rm -f "$_NODE_GROUPS_FILE" "$_NODE_NODES_FILE"
+        ;;
+    esac
+}
+
+_node_list_all() {
+    _detect_ext_addr
+
+    local json
+    json=$(_clash_api_get "/proxies")
+    [ -z "$json" ] && _failcat "内核未运行，请先执行 clashon" && return 1
+
+    local groups
+    groups=$(_node_list_groups "$json") || return 1
+
+    echo "$(_okcat '[节点] ' '所有代理组状态：')"
+    echo ""
+    while IFS= read -r group; do
+        local current type
+        current=$(echo "$json" | "$BIN_YQ" -r ".proxies.\"${group}\".now // \"\"" 2>/dev/null)
+        type=$(echo "$json" | "$BIN_YQ" -r ".proxies.\"${group}\".type // \"\"" 2>/dev/null)
+        local node_count
+        node_count=$(echo "$json" | "$BIN_YQ" -r ".proxies.\"${group}\".all | length" 2>/dev/null)
+        local padded
+        padded=$(_pad_right "$group" 10)
+        printf "    %s  [%-8s %2d] → %s\n" "$padded" "$type" "$node_count" "$current"
+    done <<< "$groups"
+    echo ""
+}
+
+_node_test_current() {
+    _detect_ext_addr
+
+    local json
+    json=$(_clash_api_get "/proxies")
+    [ -z "$json" ] && _failcat "内核未运行，请先执行 clashon" && return 1
+
+    local groups
+    groups=$(_node_list_groups "$json") || return 1
+
+    echo "$(_okcat '[节点] ' '测试当前节点延迟...')"
+    echo ""
+
+    while IFS= read -r group; do
+        local current
+        current=$(echo "$json" | "$BIN_YQ" -r ".proxies.\"${group}\".now // \"\"" 2>/dev/null)
+        [ -z "$current" ] && continue
+        _node_test_delay "$current"
+    done <<< "$groups"
+    echo ""
+}
+
+function clashnode() {
+    case "$1" in
+    -h | --help)
+        cat <<EOF
+
+clashnode - Clash 终端节点选择工具
+
+Usage:
+  clashnode              交互式选择节点
+  clashnode list         查看所有代理组及当前节点
+  clashnode <组名>       直接选择指定代理组的节点
+  clashnode test         测试当前节点延迟
+
+EOF
+        return 0
+        ;;
+    list | ls)
+        _node_list_all
+        ;;
+    test)
+        _node_test_current
+        ;;
+    *)
+        _node_interactive "$@"
+        ;;
+    esac
+}
+
 # Geographic region filtering functions
 _extract_geo_regions() {
     # Extract proxy names and detect geographic regions
@@ -968,6 +1345,10 @@ function clashctl() {
         shift
         clashupgrade "$@"
         ;;
+    node)
+        shift
+        clashnode "$@"
+        ;;
     *)
         (($#)) && shift
         clashhelp "$@"
@@ -988,6 +1369,7 @@ Commands:
   status                内核状态
   ui                    面板地址
   sub                   订阅管理
+  node                  节点选择
   geo                   地区过滤
   log                   内核日志
   tun                   Tun 模式
